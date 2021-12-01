@@ -4,11 +4,11 @@ Parameters:
   Region:
     Description: The region to run in
     Type: String
-    Default: us-east-1
+    Default: ap-northeast-1
   AppName:
     Type: String
     Description: Name of application
-    Default: npm
+    Default: c2c-npm
   VPC:
     Type: AWS::EC2::VPC::Id
     Description: The VPC
@@ -24,17 +24,7 @@ Parameters:
   EcsImage:
     Type: String
     Description: The docker image to use.
-    Default: asynchrony/docker-verdaccio-s3
-  AccessKeyId:
-    Type: String
-    Description: An IAM user access key id for the S3 Bucket
-  SecretAccessKey:
-    Type: String
-    NoEcho: true
-    Description: An IAM user secret access key for the S3 Bucket
-  BucketName:
-    Type: String
-    Description: Bucket to store modules and configuration
+    Default: verdaccio/verdaccio
   HostedZoneId:
     Type: String
     Description: The zone id to create the cname under.
@@ -43,12 +33,6 @@ Parameters:
     Description: The domain of where to host the npm registry
 
 Resources:
-
-  NpmBucket:
-    Type: AWS::S3::Bucket
-    DeletionPolicy: Delete
-    Properties:
-      BucketName: !Ref BucketName
 
   Cluster:
     Type: AWS::ECS::Cluster
@@ -186,6 +170,13 @@ Resources:
                 # Allow the ECS tasks to upload logs to CloudWatch
                 - 'logs:CreateLogStream'
                 - 'logs:PutLogEvents'
+
+                # Allow the ECS tasks to access EFS
+                - 'elasticfilesystem:CreateMountTarget'
+                - 'elasticfilesystem:ClientMount'
+                - 'elasticfilesystem:ClientWrite'
+                - 'elasticfilesystem:ClientRootAccess'
+                - 'elasticfilesystem:CreateFileSystem'
               Resource: '*'
 
   TaskLogGroup:
@@ -211,18 +202,49 @@ Resources:
           PortMappings:
             - ContainerPort: 4873
           Environment:
-            - Name: S3_BUCKET
-              Value: !Ref NpmBucket
-            - Name: AWS_ACCESS_KEY_ID
-              Value: !Ref AccessKeyId
-            - Name: AWS_SECRET_ACCESS_KEY
-              Value: !Ref SecretAccessKey
+            - Name: VERDACCIO_PUBLIC_URL
+              Value: !Sub https://${Domain}/
           LogConfiguration:
             LogDriver: awslogs
             Options:
               awslogs-group: !Ref TaskLogGroup
               awslogs-region: !Ref Region
               awslogs-stream-prefix: !Sub ${AppName}-awslogs
+          mountPoints:
+            - readOnly: false
+              containerPath: "/verdaccio/conf"
+              sourceVolume: efs-npm-conf
+            - readOnly: false
+              containerPath: "/verdaccio/plugins"
+              sourceVolume: efs-npm-plugins
+            - readOnly: false
+              containerPath: "/verdaccio/storage"
+              sourceVolume: efs-npm-storage
+      volumes:
+        - efsVolumeConfiguration:
+            fileSystemId: !Ref 'Efs'
+            authorizationConfig:
+              iam: ENABLED
+              accessPointId:
+            transitEncryption: ENABLED
+            rootDirectory: "/conf"
+          name: efs-npm-conf
+        - efsVolumeConfiguration:
+            fileSystemId: !Ref 'Efs'
+            authorizationConfig:
+              iam: ENABLED
+              accessPointId:
+            transitEncryption: ENABLED
+            rootDirectory: "/storage"
+          name: efs-npm-storage
+        - efsVolumeConfiguration:
+            fileSystemId: !Ref 'Efs'
+            authorizationConfig:
+              iam: ENABLED
+              accessPointId:
+            transitEncryption: ENABLED
+            rootDirectory: "/plugins"
+          name: efs-npm-plugins
 
   FargateService:
     Type: AWS::ECS::Service
@@ -281,7 +303,54 @@ Resources:
     Properties:
       HostedZoneId: !Ref HostedZoneId
       Name: !Ref Domain
-      Type: CNAME
-      TTL: 60
-      ResourceRecords:
-        - !GetAtt 'PublicLoadBalancer.DNSName'
+      Type: A
+      AliasTarget:
+        HostedZoneId: !GetAtt 'PublicLoadBalancer.CanonicalHostedZoneID'
+        DNSName: !GetAtt 'PublicLoadBalancer.DNSName'
+        EvaluateTargetHealth: true
+      Region: !Ref Region
+      SetIdentifier: !Sub ${AppName}-${Region}
+
+  Efs:
+    Type: AWS::EFS::FileSystem
+    Properties:
+      FileSystemTags:
+        - Key: Name
+          Value: !Ref 'AppName'
+
+  EfsSg:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub 'Allow connections from the ${AppName} ASG'
+      Tags:
+        - Key: Name
+          Value: !Sub '${AppName} EFS'
+      VpcId: !Ref 'VPC'
+
+  EfsSgFsIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref 'EfsSg'
+      FromPort: 2049
+      ToPort: 2049
+      IpProtocol: tcp
+      SourceSecurityGroupId: !Ref 'FargateContainerSecurityGroup'
+
+  EfsMountA:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref 'Efs'
+      SecurityGroups: !Ref 'EfsSg'
+      SubnetId: !Ref 'SubnetOne'
+
+  EfsMountB:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref 'Efs'
+      SecurityGroups: !Ref 'EfsSg'
+      SubnetId: !Ref 'SubnetTwo'
+
+Outputs:
+  Hostname:
+    Value: !Ref 'DnsRecordSet'
+      
